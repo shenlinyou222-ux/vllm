@@ -103,6 +103,11 @@ class InputBatch:
     # [num_reqs] per-request prompt length, only populated for R-SWA.
     prompt_lens: torch.Tensor | None
 
+    # batch_idx -> per-token attention coefficient bitmap (None = unmasked).
+    # Placed after the last field without a default: dataclasses forbid a
+    # defaulted field before a non-defaulted one.
+    kv_coeff: list[bytes | None] | None = None
+
     # [num_reqs] only populated for non-dummy pipeline-parallel batches.
     max_seq_len_np: np.ndarray | None = None
 

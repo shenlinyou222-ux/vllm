@@ -461,6 +461,10 @@ class CommonAttentionMetadata:
     where bidirectional attention should apply. None for text-only
     batches or non-PrefixLM models. A request's ranges must not overlap."""
 
+    # {batch row: per-token coefficient bitmap}. Only requests that opted
+    # in; None when no request in the batch is masked.
+    kv_coeff: dict[int, bytes] | None = None
+
     rswa_prefix_lens: torch.Tensor | None = None
     """(batch_size,) per-request prefix length (prompt/image token count) for
     Reference Sliding Window Attention (R-SWA). Tokens with logical index below

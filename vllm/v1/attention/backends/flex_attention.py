@@ -832,6 +832,72 @@ class FlexAttentionMetadata:
         self.transformed_score_mod = self.get_transformed_score_mod()
 
 
+# (bitmap, block_size, device) -> per-block visibility tensor. The bitmap is
+# part of the key as bytes rather than as hash(bitmap): a 64-bit digest could
+# collide and silently hand a request somebody else's mask.
+_KV_COEFF_BLOCK_CACHE: dict[tuple[bytes, int, int | None], torch.Tensor] = {}
+_KV_COEFF_HINT_LOGS = [0]
+
+
+def _make_kv_coeff_hint(md, kv_coeff):
+    """Build a block-sparsity hint from per-token attention coefficients.
+
+    A block is visible only if all its tokens are visible. The query's own block
+    is always kept: a row with no visible keys makes softmax divide by zero.
+    """
+    import numpy as np
+
+    bs = md.block_size
+    device = md.block_table.device
+    per_req = {}
+    for idx, data in kv_coeff.items():
+        # The per-block view is a pure function of the bitmap and the block size,
+        # and a request keeps the same bitmap for its whole life, so cache it:
+        # otherwise every decode step pays unpack + reshape + H2D again.
+        key = (data, bs, device.index)
+        visible = _KV_COEFF_BLOCK_CACHE.get(key)
+        if visible is None:
+            # bitorder="little": bit 0 of a byte is the earliest token, matching
+            # the documented LSB-first wire format.
+            bits = np.unpackbits(
+                np.frombuffer(data, dtype=np.uint8), bitorder="little"
+            ).astype(bool)
+            # pad with True: padding bits are not real tokens and must not hide
+            # a block
+            bits = np.pad(bits, (0, -len(bits) % bs), constant_values=True)
+            visible = torch.from_numpy(bits.reshape(-1, bs).all(axis=1)).to(device)
+            if len(_KV_COEFF_BLOCK_CACHE) > 4096:
+                _KV_COEFF_BLOCK_CACHE.clear()
+            _KV_COEFF_BLOCK_CACHE[key] = visible
+        per_req[idx] = visible
+
+    if _KV_COEFF_HINT_LOGS[0] < 3:
+        _KV_COEFF_HINT_LOGS[0] += 1
+        logger.info(
+            "kv_coeff block mask: reqs=%d block_size=%d blocks_per_req=%s "
+            "hidden_blocks=%s",
+            len(per_req),
+            bs,
+            [int(v.numel()) for v in per_req.values()],
+            [int((~v).sum()) for v in per_req.values()],
+        )
+
+    def hint_fn(q_block_idx, kv_block_idx, block_size):
+        out = torch.ones(
+            (q_block_idx.shape[0], kv_block_idx.shape[1]),
+            dtype=torch.bool,
+            device=kv_block_idx.device,
+        )
+        for idx, visible in per_req.items():
+            # Columns are logical block ids (see `used_pages` in
+            # _build_block_mask_direct), so column i is this request's i-th
+            # block regardless of where those blocks live in the cache.
+            out[md.doc_ids == idx, : visible.numel()] = visible
+        return out | (kv_block_idx == q_block_idx)
+
+    return hint_fn
+
+
 class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
@@ -1124,6 +1190,11 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             rswa_prefix_lens=rswa_prefix_lens,
             rswa_window=self.rswa_window,
         )
+
+        if common_attn_metadata.kv_coeff:
+            out.block_sparsity_hint = BlockSparsityHint(
+                hint_fn=_make_kv_coeff_hint(out, common_attn_metadata.kv_coeff)
+            )
 
         # Pre-build block_mask so it is ready before CUDA graph capture.
         # Without this, the lazy build in forward() would run non-graph-safe

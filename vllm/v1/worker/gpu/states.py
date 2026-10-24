@@ -26,6 +26,8 @@ class RequestState:
         self.device = device
 
         self.req_id_to_index: dict[str, int] = {}
+        # Per-request attention coefficient bitmap (bytes), keyed by request id.
+        self.kv_coeff: dict[str, bytes] = {}
         self.index_to_req_id: dict[int, str] = {}
         self.free_indices = list(range(max_num_reqs))
 
@@ -95,10 +97,13 @@ class RequestState:
         all_token_ids: list[int],
         num_computed_tokens: int,
         max_tokens: int,
+        kv_coeff: bytes | None = None,
     ) -> None:
         assert len(self.free_indices) > 0, "No free indices"
         req_idx = self.free_indices.pop()
         self.req_id_to_index[req_id] = req_idx
+        if kv_coeff is not None:
+            self.kv_coeff[req_id] = kv_coeff
         self.index_to_req_id[req_idx] = req_id
 
         self.max_seq_len[req_idx] = prompt_len + max_tokens
@@ -127,6 +132,7 @@ class RequestState:
     def remove_request(self, req_id: str) -> int | None:
         """Return the freed slot index, or None if the request was not found."""
         req_idx = self.req_id_to_index.pop(req_id, None)
+        self.kv_coeff.pop(req_id, None)
         if req_idx is None:
             return None
         self.index_to_req_id.pop(req_idx, None)

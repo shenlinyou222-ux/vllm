@@ -196,6 +196,93 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 logger = init_logger(__name__)
 
 
+# (reason, detail) -> already warned. A client that always sends the same broken
+# payload must not be able to flood the log.
+_KV_COEFF_WARNED: set[tuple[str, str]] = set()
+_KV_COEFF_FIRST_USE = [True]
+_KV_COEFF_GRAPH_WARNED = [False]
+
+
+def _kv_coeff_ignored(reason: str, detail: str) -> None:
+    """Report a dropped bitmap: debug per request, warning once per cause."""
+    logger.debug("kv_coeff payload ignored: reason=%s %s", reason, detail)
+    key = (reason, detail)
+    # Bounded: a client that varies the detail string must not grow this set
+    # without limit.
+    if key not in _KV_COEFF_WARNED and len(_KV_COEFF_WARNED) < 256:
+        _KV_COEFF_WARNED.add(key)
+        logger.warning(
+            "kv_coeff payload ignored (reason=%s, %s); this request runs unmasked",
+            reason,
+            detail,
+        )
+
+
+def _decode_kv_coeff(
+    sampling_params, prompt_len: int, req_id: str = "", graphs_enabled: bool = False
+) -> bytes | None:
+    # A malformed payload is ignored rather than raised: an exception here tears
+    # down the engine, and payload validity is the caller's contract.
+    import base64
+
+    extra = getattr(sampling_params, "extra_args", None)
+    raw = extra.get("kv_coeff") if extra else None
+    if not raw:
+        return None
+    if not isinstance(raw, (str, bytes, bytearray)):
+        # Numbers, booleans and lists would otherwise be silently reinterpreted
+        # as bytes; reject them so the caller sees a warning instead.
+        _kv_coeff_ignored("bad_type", f"type={type(raw).__name__}")
+        return None
+    try:
+        data = base64.b64decode(raw) if isinstance(raw, str) else bytes(raw)
+    except Exception as exc:  # binascii.Error is a ValueError subclass
+        _kv_coeff_ignored("decode_error", type(exc).__name__)
+        return None
+    # Accept only an exact byte-for-token payload. A shorter one would shift
+    # every position; a longer one means the server truncated the prompt, and we
+    # cannot tell which end was cut -- guessing wrong mislabels everything after
+    # the cut. Ignore the bitmap instead of guessing.
+    if not prompt_len <= len(data) * 8 < prompt_len + 8:
+        _kv_coeff_ignored(
+            "length_mismatch",
+            f"{len(data)} bytes ({len(data) * 8} bits) for {prompt_len} tokens",
+        )
+        return None
+    # The payload is byte-aligned but the prompt is not: the spare bits in the
+    # last byte are padding, not real tokens. Mark them visible, otherwise the
+    # final block (which holds the live question) is hidden whole.
+    spare = (8 - prompt_len % 8) % 8
+    if spare:
+        data = data[:-1] + bytes([data[-1] | ((0xFF << (8 - spare)) & 0xFF)])
+    hidden = prompt_len - sum(byte.bit_count() for byte in data)
+    if hidden and graphs_enabled and not _KV_COEFF_GRAPH_WARNED[0]:
+        _KV_COEFF_GRAPH_WARNED[0] = True
+        logger.warning(
+            "kv_coeff is active while CUDA graphs are enabled: the mask is "
+            "rebuilt per step and has not been validated under graph replay. "
+            "Use --enforce-eager if outputs look wrong."
+        )
+    if hidden:
+        if _KV_COEFF_FIRST_USE[0]:
+            _KV_COEFF_FIRST_USE[0] = False
+            logger.info(
+                "kv_coeff active: req_id=%s prompt_len=%d hidden_tokens=%d "
+                "(further requests logged at debug level)",
+                req_id,
+                prompt_len,
+                hidden,
+            )
+        else:
+            logger.debug(
+                "kv_coeff active: req_id=%s prompt_len=%d hidden_tokens=%d",
+                req_id,
+                prompt_len,
+                hidden,
+            )
+    return data
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -1217,6 +1304,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 all_token_ids=new_req_data.prefill_token_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+                kv_coeff=_decode_kv_coeff(
+                    sampling_params,
+                    prompt_len,
+                    req_id,
+                    graphs_enabled=self.compilation_config.cudagraph_mode
+                    != CUDAGraphMode.NONE,
+                ),
             )
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
@@ -1531,6 +1625,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         input_batch = InputBatch(
             req_ids=req_ids,
+            kv_coeff=(
+                [self.req_states.kv_coeff.get(rid) for rid in req_ids]
+                if self.req_states.kv_coeff
+                else None
+            ),
             num_reqs=num_reqs,
             num_reqs_after_padding=num_reqs_padded,
             idx_mapping=idx_mapping,

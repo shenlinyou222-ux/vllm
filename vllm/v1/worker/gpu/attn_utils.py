@@ -473,6 +473,7 @@ def build_attn_metadata(
     positions: torch.Tensor | None = None,
     is_prefilling: torch.Tensor | None = None,
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None,
+    kv_coeff: list[bytes | None] | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
@@ -524,6 +525,12 @@ def build_attn_metadata(
                 num_logits_indices=fast_prefill.num_logits_indices,
                 max_logits_per_req=fast_prefill.max_logits_per_req,
             )
+        kv_coeff_map: dict[int, bytes] | None = None
+        if kv_coeff is not None:
+            kv_coeff_map = {i: v for i, v in enumerate(kv_coeff) if v is not None}
+            if not kv_coeff_map:
+                kv_coeff_map = None
+
         common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
@@ -541,6 +548,7 @@ def build_attn_metadata(
             positions=positions,
             is_prefilling=group_is_prefilling,
             mm_req_doc_ranges=mm_req_doc_ranges,
+            kv_coeff=kv_coeff_map,
             rswa_prefix_lens=rswa_prefix_lens,
             req_idx=req_idx,
             _token_to_req_indices_cache=token_to_req_indices,

@@ -232,6 +232,7 @@ class DefaultModelState(ModelState):
             positions=input_batch.positions,
             is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
             mm_req_doc_ranges=req_doc_ranges,
+            kv_coeff=input_batch.kv_coeff,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
             req_idx=input_batch.idx_mapping_np,
